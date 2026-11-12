@@ -1,0 +1,3 @@
+v1.0:
+	initial version: access point on the built-in wifi of the Raspberry Pi,
+	using the hostapd service template of Venus OS v3.85

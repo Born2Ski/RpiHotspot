@@ -1,0 +1,5 @@
+#!/bin/sh
+echo "*** starting hostapd ***"
+exec 2>&1
+. /etc/profile.d/profile.sh
+exec /data/RpiHotspot/hostapd-run

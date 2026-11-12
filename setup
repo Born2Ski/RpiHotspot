@@ -1,0 +1,89 @@
+#!/bin/bash
+
+# RpiHotspot: Wi-Fi access point ("hotspot") for Venus OS on a Raspberry Pi
+#
+# venus-platform and the GUI already support the access point of the GX
+# devices. They only look for the hostapd service template: when
+#   /opt/victronenergy/service-templates/conf/hostapd.conf
+# exists, venus-platform adds Settings/Services/AccessPoint, the GUI shows
+# "Create access point" and the access point password, and venus-platform
+# adds / removes /service/hostapd with svectl when it is switched on / off.
+#
+# Venus OS doesn't ship hostapd for the Raspberry Pi, so this package installs
+# that template. The service runs hostapd-run from this package directory,
+# which sets up the Pi's built-in wifi as access point (see hostapd-run).
+#
+# NOTE: SetupHelper's services mechanism is not used for hostapd on purpose:
+# switching the access point off makes venus-platform run "svectl -r", which
+# also deletes /opt/victronenergy/service/hostapd.
+
+templateDir="/opt/victronenergy/service-templates/hostapd"
+templateConf="/opt/victronenergy/service-templates/conf/hostapd.conf"
+svectl="/opt/victronenergy/venus-platform/svectl"
+
+#### following line incorporates helper resources into this script
+source "/data/SetupHelper/HelperResources/IncludeHelpers"
+#### end of lines to include helper resources
+
+# marks the template as installed by this package
+installedFlag="$templateDir/.$packageName"
+templateChanged=false
+
+if [ $scriptAction == 'NONE' ]; then
+	echo
+	echo "This package adds a Wi-Fi access point using the built-in wifi."
+	echo "Enable it and set its password in the GUI: Settings / Wi-Fi."
+	standardActionPrompt
+fi
+
+if [ $scriptAction == 'INSTALL' ]; then
+	case "$machine" in
+		# the bundled hostapd is built for 32 bit arm (cortexa7hf-neon-vfpv4)
+		raspberrypi2|raspberrypi4)
+			;;
+		*)
+			setInstallFailed $EXIT_INCOMPATIBLE_PLATFORM "$packageName does not support $machine"
+			;;
+	esac
+
+	# don't interfere with a firmware that provides the access point itself
+	if ! $installFailed && [ -e "$templateConf" ] && ! [ -e "$installedFlag" ]; then
+		setInstallFailed $EXIT_PACKAGE_CONFLICT "this firmware already provides a hostapd service"
+	fi
+
+	if ! $installFailed; then
+		logMessage "installing the hostapd service template"
+		templateChanged=true
+		chmod 755 "$scriptDir/hostapd-run" "$scriptDir/bin/hostapd" "$scriptDir/bin/hostapd_cli"
+		if mkdir -p "$templateDir/log" \
+				&& cp "$scriptDir/template/run" "$templateDir/run" \
+				&& cp "$scriptDir/template/log/run" "$templateDir/log/run" \
+				&& chmod 755 "$templateDir/run" "$templateDir/log/run" \
+				&& touch "$installedFlag" \
+				&& cp "$scriptDir/template/hostapd.conf" "$templateConf"; then
+			# the password setting is normally added by the hostapd package
+			addAllDbusSettings
+		else
+			setInstallFailed $EXIT_ERROR "could not install the hostapd service template"
+		fi
+	fi
+fi
+
+if [ $scriptAction == 'UNINSTALL' ] || $installFailed; then
+	if [ -e "$installedFlag" ]; then
+		logMessage "removing the hostapd service and its template"
+		# stops hostapd-run, which takes ap0 down again
+		"$svectl" -r -s hostapd
+		rm -f "$templateConf"
+		rm -rf "$templateDir"
+		templateChanged=true
+	fi
+fi
+
+# venus-platform only checks for the template when it starts
+if $templateChanged && [ -e /service/venus-platform ]; then
+	logMessage "restarting venus-platform"
+	svc -t /service/venus-platform
+fi
+
+endScript

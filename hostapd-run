@@ -1,0 +1,166 @@
+#!/bin/sh
+#
+# RpiHotspot: runs the Wi-Fi access point on the built-in wifi of a Raspberry Pi
+#
+# This is /service/hostapd. venus-platform adds and removes that service (from
+# /opt/victronenergy/service-templates/hostapd) when the access point is switched
+# on / off in the GUI, and restarts it when the access point password changes.
+#
+# It is based on hostapd-run of the GX devices, which can't be used as is, since
+# the Raspberry Pi:
+#  - has no second wifi interface: ap0 is added to the built-in brcmfmac wifi
+#  - has no factory serial number: the unique id is used for the network name
+#  - has no factory wifi password: it waits for one to be set in the GUI
+#  - can only use one channel at a time: the access point follows the channel
+#    of the wifi client connection, if there is one
+#  - doesn't run dnsmasq for ap0: this script runs it
+
+pkg=/data/RpiHotspot
+ap=ap0
+ap_addr=172.24.24.1/24
+conf=/run/hostapd.conf
+
+hostapd_pid=
+dnsmasq_pid=
+sleep_pid=
+
+cleanup() {
+	trap - EXIT
+	for pid in $hostapd_pid $dnsmasq_pid $sleep_pid; do
+		kill $pid 2>/dev/null
+	done
+	wait 2>/dev/null
+	if [ -e /sys/class/net/$ap ]; then
+		ip addr flush dev $ap
+		ip link set $ap down
+	fi
+}
+
+trap cleanup EXIT
+trap 'exit 0' TERM INT HUP
+
+# sleep, but can be interrupted by svc -t / svc -d
+pause() {
+	sleep "$1" &
+	sleep_pid=$!
+	wait $sleep_pid
+	sleep_pid=
+}
+
+# daemontools restarts this script as soon as it exits, so wait a bit first
+retry() {
+	echo "$*, retrying in 30 seconds"
+	pause 30
+	exit 1
+}
+
+# the built-in wifi in station mode: the brcmfmac interface that isn't ap0
+find_sta() {
+	for dev in /sys/class/net/*; do
+		name=${dev##*/}
+		[ "$name" = "$ap" ] && continue
+		driver=$(readlink "$dev/device/driver") || continue
+		[ "${driver##*/}" = brcmfmac ] || continue
+		echo "$name"
+		return 0
+	done
+	return 1
+}
+
+# channel of the wifi client connection, empty if not connected
+sta_channel() {
+	freq=$(iw dev "$sta" link 2>/dev/null | awk '$1 == "freq:" { print int($2); exit }')
+	[ -n "$freq" ] || return
+	if [ "$freq" -eq 2484 ]; then
+		echo 14
+	elif [ "$freq" -lt 3000 ]; then
+		echo $(( (freq - 2407) / 5 ))
+	else
+		echo $(( (freq - 5000) / 5 ))
+	fi
+}
+
+# same as hostapd-run of the GX devices: only accept 8 to 63 characters
+get_password() {
+	dbus-send --system --print-reply --dest=com.victronenergy.settings /Settings/Services/AccessPointPassword com.victronenergy.BusItem.GetValue 2>/dev/null |
+		grep variant |
+		awk '{ if (gsub(/^\s+variant\s+string\s+"|"$/, "", $0) == 2 && length($0) >= 8 && length($0) <= 63) print$0 }'
+}
+
+sta=$(find_sta) || retry "no built-in wifi (brcmfmac) found"
+
+if ! [ -e /sys/class/net/$ap ]; then
+	echo "adding $ap to $sta"
+	iw dev "$sta" interface add $ap type __ap || retry "could not add $ap to $sta"
+fi
+
+# brcmfmac ignores the address passed to "iw interface add" and gives ap0 the
+# address of the station. Set the locally administered bit to tell them apart.
+mac=$(cat /sys/class/net/$sta/address)
+apmac=$(printf '%02x' $(( 0x${mac%%:*} | 2 ))):${mac#*:}
+if [ "$(cat /sys/class/net/$ap/address)" != "$apmac" ]; then
+	ip link set $ap down
+	ip link set $ap address $apmac || echo "WARNING: could not set the address of $ap to $apmac"
+fi
+
+psk=$(get_password)
+[ -n "$psk" ] || psk=$(cat /data/venus/wpa-psk 2>/dev/null)
+[ -n "$psk" ] || retry "no access point password set, set one in Settings / Wi-Fi"
+
+uid=$(cat /data/venus/unique-id 2>/dev/null)
+[ -n "$uid" ] || retry "no unique id yet"
+serial=$(cat /data/venus/serial-number 2>/dev/null)
+if [ -n "$serial" ]; then
+	ssid="venus-$serial-${uid#${uid%???}}"
+else
+	ssid="venus-$uid"
+fi
+
+channel=$(sta_channel)
+[ -n "$channel" ] || channel=1
+if [ "$channel" -gt 14 ]; then
+	hw_mode=a
+else
+	hw_mode=g
+fi
+
+echo "Creating $conf"
+{
+	cat $pkg/hostapd.conf
+	echo "ssid=$ssid"
+	echo "wpa_passphrase=$psk"
+	echo "hw_mode=$hw_mode"
+	echo "channel=$channel"
+} >$conf || retry "could not create $conf"
+
+rfkill unblock wifi
+
+ip addr flush dev $ap
+ip addr add $ap_addr dev $ap || retry "could not set the address of $ap"
+ip link set $ap up
+
+dnsmasq -k -C $pkg/dnsmasq.ap.conf -x /run/dnsmasq.ap.pid &
+dnsmasq_pid=$!
+
+echo "starting access point $ssid on channel $channel"
+$pkg/bin/hostapd $conf &
+hostapd_pid=$!
+
+# The access point and the wifi client connection must use the same channel.
+# Restart when the client connects to a network on another channel.
+while kill -0 $hostapd_pid 2>/dev/null; do
+	if ! kill -0 $dnsmasq_pid 2>/dev/null; then
+		retry "dnsmasq stopped"
+	fi
+
+	pause 10
+
+	now=$(sta_channel)
+	if [ -n "$now" ] && [ "$now" != "$channel" ]; then
+		echo "the wifi client connection is on channel $now, restarting the access point"
+		exit 1
+	fi
+done
+
+hostapd_pid=
+retry "hostapd stopped"
